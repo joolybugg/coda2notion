@@ -94,10 +94,22 @@ def _request(
     max_retries: int = 6,
     **kwargs: Any,
 ) -> requests.Response:
-    """Issue a request with throttling and backoff on 429/5xx."""
+    """Issue a request with throttling and backoff on 429/5xx and network errors."""
+    kwargs.setdefault("timeout", 90)
     for attempt in range(max_retries):
         throttle.wait()
-        resp = session.request(method, url, timeout=60, **kwargs)
+        try:
+            resp = session.request(method, url, **kwargs)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if attempt == max_retries - 1:
+                raise
+            delay = min(2 ** attempt, 30)
+            log.warning(
+                "%s %s -> network error (%s); retrying in %.1fs (attempt %d/%d)",
+                method, url, type(exc).__name__, delay, attempt + 1, max_retries,
+            )
+            time.sleep(delay)
+            continue
         if resp.status_code < 400:
             return resp
         if resp.status_code == 429 or resp.status_code >= 500:
@@ -109,10 +121,8 @@ def _request(
             )
             time.sleep(delay)
             continue
-        # Non-retryable: surface the body to help debugging.
         raise RuntimeError(f"{method} {url} failed {resp.status_code}: {resp.text}")
     raise RuntimeError(f"{method} {url} exhausted retries")
-
 
 # --------------------------------------------------------------------------- #
 # Coda client                                                                 #
