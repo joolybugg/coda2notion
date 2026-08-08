@@ -3,7 +3,7 @@
 coda_to_notion.py
 =================
 
-Migrate one Coda (now Superhuman Docs) doc's tables into Notion databases via an
+Migrate one Coda (Superhuman Docs) doc's tables into Notion databases via
 API-to-API transfer, preserving column types and (crucially) inter-table
 relations that a CSV export flattens into plain text.
 
@@ -19,25 +19,33 @@ Two-pass design (single run):
           data source pointing at the target data source, then patch each page
           to set the relation links.
 
-State is written to migration_state.json for inspection and partial re-runs.
+Resumable: progress is saved to migration_state_<doc_id>.json as it goes. If a
+run is interrupted (crash, timeout, Ctrl+C), just run it again with the same
+CODA_DOC_ID and it picks up where it left off -- completed tables are skipped,
+partially-inserted tables continue from the last saved row, and databases are
+reused rather than recreated. Use --restart to discard saved progress and begin
+the doc from scratch (note: this does NOT delete databases already created in
+Notion, so remove those manually first to avoid duplicates).
 
-Configuration (environment variables, or a local .env file):
-  CODA_API_TOKEN         Coda API token (account settings -> API)
+Credentials and targets are read from environment variables (a .env file is
+supported). Copy .env.example to .env and fill it in:
+
+  CODA_API_TOKEN         Coda / Superhuman Docs API token
   NOTION_API_TOKEN       Notion internal integration secret
-  CODA_DOC_ID            Doc id (the part after "_d" in a doc URL)
-  NOTION_PARENT_PAGE_ID  A Notion page the databases are created under; the
-                         integration must be connected to this page.
+  CODA_DOC_ID            Doc id (the part after "_d" in the doc URL)
+  NOTION_PARENT_PAGE_ID  Notion page the databases are created under; the
+                         integration must be connected to this page
 
 Run:
   python coda_to_notion.py
+  python coda_to_notion.py --restart
 
-Requirements:  Python 3.9+, `pip install requests` (optionally `python-dotenv`).
-Known-fragile spots are logged rather than silently skipped; see the summary
-at the end and the README notes.
+Requirements:  Python 3.9+, `pip install -r requirements.txt`
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -59,7 +67,8 @@ CODA_BASE = "https://coda.io/apis/v1"
 NOTION_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2025-09-03"
 
-STATE_PATH = "migration_state.json"
+# Save progress to disk every N rows so a crash loses at most this many inserts.
+SAVE_EVERY = 25
 
 # Notion caps rich_text content at 2000 chars per text object.
 TEXT_LIMIT = 2000
@@ -101,6 +110,8 @@ def _request(
         try:
             resp = session.request(method, url, **kwargs)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            # Network hiccups (read timeouts, dropped connections) are transient;
+            # back off and retry rather than crashing a long migration.
             if attempt == max_retries - 1:
                 raise
             delay = min(2 ** attempt, 30)
@@ -121,8 +132,10 @@ def _request(
             )
             time.sleep(delay)
             continue
+        # Non-retryable: surface the body to help debugging.
         raise RuntimeError(f"{method} {url} failed {resp.status_code}: {resp.text}")
     raise RuntimeError(f"{method} {url} exhausted retries")
+
 
 # --------------------------------------------------------------------------- #
 # Coda client                                                                 #
@@ -442,13 +455,18 @@ def build_column_plans(
 
 
 # --------------------------------------------------------------------------- #
-# Configuration                                                               #
+# Config + resumable state                                                    #
 # --------------------------------------------------------------------------- #
+
+def _split_names(raw: str | None) -> list[str]:
+    """Parse a comma-separated list of table names into a clean list."""
+    if not raw:
+        return []
+    return [name.strip() for name in raw.split(",") if name.strip()]
+
 
 def load_config() -> dict:
     """Read required settings from the environment (optionally via a .env file)."""
-    # Optional convenience: if python-dotenv is installed and a .env file exists,
-    # load it. The tool works fine without it when the vars are already exported.
     try:
         from dotenv import load_dotenv
         load_dotenv()
@@ -460,6 +478,10 @@ def load_config() -> dict:
         "notion_token": os.environ.get("NOTION_API_TOKEN"),
         "doc_id": os.environ.get("CODA_DOC_ID"),
         "parent_page": os.environ.get("NOTION_PARENT_PAGE_ID"),
+        # Optional table filters (comma-separated table names). Command-line
+        # --skip / --only override these when provided.
+        "skip_tables": _split_names(os.environ.get("CODA_SKIP_TABLES")),
+        "only_tables": _split_names(os.environ.get("CODA_ONLY_TABLES")),
     }
     missing = [name for name, key in (
         ("CODA_API_TOKEN", "coda_token"),
@@ -474,31 +496,93 @@ def load_config() -> dict:
     return cfg
 
 
+def state_path_for(doc_id: str) -> str:
+    """One state file per doc, so migrating different docs never collide."""
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in doc_id)
+    return f"migration_state_{safe}.json"
+
+
+def load_state(path: str, doc_id: str, parent_page: str) -> dict:
+    """Load saved progress for this doc, or start a fresh state object."""
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+        if state.get("doc_id") == doc_id:
+            state.setdefault("tables", {})
+            done = sum(1 for r in state["tables"].values() if r.get("complete"))
+            log.info("Resuming from %s: %d table(s) already complete", path, done)
+            return state
+        log.warning("State file %s is for a different doc; ignoring it.", path)
+    return {"doc_id": doc_id, "parent_page": parent_page, "tables": {}}
+
+
+def save_state(path: str, state: dict) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, ensure_ascii=False)
+
+
 # --------------------------------------------------------------------------- #
 # Migration driver                                                            #
 # --------------------------------------------------------------------------- #
 
-def migrate() -> None:
+def migrate(
+    restart: bool = False,
+    skip_tables: list[str] | None = None,
+    only_tables: list[str] | None = None,
+) -> None:
     cfg = load_config()
     coda_token = cfg["coda_token"]
     notion_token = cfg["notion_token"]
     doc_id = cfg["doc_id"]
     parent_page = cfg["parent_page"]
 
+    # Command-line filters win over env-var filters; fall back to env, then none.
+    skip = set(skip_tables if skip_tables is not None else cfg["skip_tables"])
+    only = set(only_tables if only_tables is not None else cfg["only_tables"])
+    if skip:
+        log.info("Skipping tables: %s", ", ".join(sorted(skip)))
+    if only:
+        log.info("Migrating only tables: %s", ", ".join(sorted(only)))
+
     coda = CodaClient(coda_token)
     notion = NotionClient(notion_token)
+
+    state_path = state_path_for(doc_id)
+    if restart and os.path.exists(state_path):
+        log.warning(
+            "--restart: discarding saved progress in %s. Databases already "
+            "created in Notion are NOT removed; delete them manually to avoid "
+            "duplicates.", state_path,
+        )
+        os.remove(state_path)
+
+    state = load_state(state_path, doc_id, parent_page)
+    tables_state: dict[str, dict] = state["tables"]
 
     tables = coda.list_tables(doc_id)
     log.info("Found %d table(s) in Coda doc %s", len(tables), doc_id)
 
-    # coda_table_id -> record of everything we learn/create
-    state: dict[str, dict] = {}
-
     # -------- Pass 1: schema + rows -------- #
     for tbl in tables:
         tid, tname = tbl["id"], tbl.get("name", tbl["id"])
-        log.info("Reading table %r (%s)", tname, tid)
 
+        # Apply table-name filters. `only` (if set) is an allow-list; `skip` is
+        # a deny-list. A table already recorded in state is left as-is.
+        if only and tname not in only and tid not in tables_state:
+            log.info("Skipping table %r: not in --only list", tname)
+            continue
+        if tname in skip and tid not in tables_state:
+            log.info("Skipping table %r: in skip list", tname)
+            continue
+
+        rec = tables_state.get(tid)
+
+        if rec and rec.get("complete"):
+            log.info("Skipping table %r (%s): already migrated, %d rows",
+                     tname, tid, len(rec["row_map"]))
+            continue
+
+        log.info("Reading table %r (%s)", tname, tid)
         detail = coda.get_table(doc_id, tid)
         display_column_id = (detail.get("displayColumn") or {}).get("id")
         columns = coda.list_columns(doc_id, tid)
@@ -507,12 +591,36 @@ def migrate() -> None:
 
         scalar_plans, relation_plans = build_column_plans(columns, rows, display_column_id)
 
-        properties = {p.name: notion_property_def(p) for p in scalar_plans}
-        db_id, ds_id = notion.create_database(parent_page, tname, properties)
-        log.info("  created Notion database %s (data source %s)", db_id, ds_id)
+        if rec and rec.get("notion_data_source_id"):
+            # Resume a partially-inserted table: reuse its database and row map.
+            ds_id = rec["notion_data_source_id"]
+            row_map = rec["row_map"]
+            log.info("  resuming into existing database %s (%d/%d rows already done)",
+                     rec["notion_database_id"], len(row_map), len(rows))
+        else:
+            properties = {p.name: notion_property_def(p) for p in scalar_plans}
+            db_id, ds_id = notion.create_database(parent_page, tname, properties)
+            row_map = {}
+            log.info("  created Notion database %s (data source %s)", db_id, ds_id)
+            rec = {
+                "coda_table_id": tid,
+                "coda_table_name": tname,
+                "notion_database_id": db_id,
+                "notion_data_source_id": ds_id,
+                "row_map": row_map,
+                "relations": [
+                    {"name": rp.name, "coda_column_id": rp.coda_id} for rp in relation_plans
+                ],
+                "complete": False,
+                "relations_wired": False,
+            }
+            tables_state[tid] = rec
+            save_state(state_path, state)  # record the db before inserting rows
 
-        row_map: dict[str, str] = {}
+        inserted = 0
         for row in rows:
+            if row["id"] in row_map:
+                continue  # already inserted on a prior run
             props: dict[str, Any] = {}
             for p in scalar_plans:
                 built = notion_property_value(p, row.get("values", {}).get(p.coda_id))
@@ -526,28 +634,26 @@ def migrate() -> None:
                 }
             page_id = notion.create_page(ds_id, props)
             row_map[row["id"]] = page_id
+            inserted += 1
+            if inserted % SAVE_EVERY == 0:
+                save_state(state_path, state)
 
-        log.info("  inserted %d pages", len(row_map))
-
-        state[tid] = {
-            "coda_table_id": tid,
-            "coda_table_name": tname,
-            "notion_database_id": db_id,
-            "notion_data_source_id": ds_id,
-            "row_map": row_map,
-            "relations": [
-                {"name": rp.name, "coda_column_id": rp.coda_id} for rp in relation_plans
-            ],
-        }
-        save_state(state)
+        rec["complete"] = True
+        save_state(state_path, state)
+        log.info("  inserted %d new page(s); %d rows total", inserted, len(row_map))
 
     # -------- Pass 2: relations -------- #
     # Build a Coda-table-id -> Notion-data-source-id index for resolving targets.
-    ds_by_coda_table = {tid: rec["notion_data_source_id"] for tid, rec in state.items()}
+    ds_by_coda_table = {tid: rec["notion_data_source_id"] for tid, rec in tables_state.items()}
 
-    for tid, rec in state.items():
+    for tid, rec in tables_state.items():
         if not rec["relations"]:
+            rec["relations_wired"] = True
             continue
+        if rec.get("relations_wired"):
+            log.info("Skipping relations for %r: already wired", rec["coda_table_name"])
+            continue
+
         log.info("Wiring relations for table %r", rec["coda_table_name"])
         rows = coda.list_rows(doc_id, tid)  # re-read to get rich reference values
         rows_by_id = {r["id"]: r for r in rows}
@@ -575,7 +681,7 @@ def migrate() -> None:
 
             notion.add_relation_property(rec["notion_data_source_id"], prop_name, target_ds)
 
-            target_row_map = state[target_coda_table]["row_map"]
+            target_row_map = tables_state[target_coda_table]["row_map"]
             wired = 0
             for coda_row_id, page_id in rec["row_map"].items():
                 row = rows_by_id.get(coda_row_id)
@@ -592,27 +698,49 @@ def migrate() -> None:
                     wired += 1
             log.info("  %r -> %s: linked %d rows", prop_name, target_coda_table, wired)
 
-    save_state(state)
-    log.info("Done. State written to %s", STATE_PATH)
+        rec["relations_wired"] = True
+        save_state(state_path, state)
+
+    save_state(state_path, state)
+    log.info("Done. State saved to %s", state_path)
     print("\nSummary")
-    for rec in state.values():
+    for rec in tables_state.values():
         print(
             f"  {rec['coda_table_name']}: {len(rec['row_map'])} rows, "
             f"{len(rec['relations'])} relation column(s) -> database {rec['notion_database_id']}"
         )
 
 
-# --------------------------------------------------------------------------- #
-# Helpers                                                                      #
-# --------------------------------------------------------------------------- #
-
-def save_state(state: dict) -> None:
-    with open(STATE_PATH, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, indent=2, ensure_ascii=False)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Migrate a Coda doc's tables into Notion.")
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Discard saved progress for this doc and start over. Does not "
+             "delete databases already created in Notion.",
+    )
+    parser.add_argument(
+        "--skip",
+        metavar="NAMES",
+        help="Comma-separated table names to exclude (deny-list). Overrides "
+             "CODA_SKIP_TABLES.",
+    )
+    parser.add_argument(
+        "--only",
+        metavar="NAMES",
+        help="Comma-separated table names to migrate exclusively (allow-list). "
+             "Overrides CODA_ONLY_TABLES.",
+    )
+    args = parser.parse_args()
+    # None means "not provided on the command line" so env vars can apply;
+    # an explicit flag (even empty) takes precedence.
+    skip = _split_names(args.skip) if args.skip is not None else None
+    only = _split_names(args.only) if args.only is not None else None
+    try:
+        migrate(restart=args.restart, skip_tables=skip, only_tables=only)
+    except KeyboardInterrupt:
+        log.warning("Interrupted. Progress was saved; re-run to resume.")
 
 
 if __name__ == "__main__":
-    try:
-        migrate()
-    except KeyboardInterrupt:
-        log.warning("Interrupted; partial state saved to %s", STATE_PATH)
+    main()
