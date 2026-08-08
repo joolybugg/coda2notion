@@ -438,7 +438,7 @@ def build_column_plans(
                 if isinstance(val, list):
                     saw_list = True
                     for v in val:
-                        if str(v).strip():
+                        if v not in (None, ""):
                             plan.options.add(sanitize_option(str(v)))
                 elif val not in (None, ""):
                     plan.options.add(sanitize_option(str(val)))
@@ -659,6 +659,8 @@ def migrate(
         rows_by_id = {r["id"]: r for r in rows}
 
         for rel in rec["relations"]:
+            if rel.get("wired"):
+                continue
             col_id, prop_name = rel["coda_column_id"], rel["name"]
 
             # Determine the target table from the first resolvable reference.
@@ -670,6 +672,8 @@ def migrate(
                     break
             if target_coda_table is None:
                 log.info("  %r: no references found; leaving empty", prop_name)
+                rel["wired"] = True
+                save_state(state_path, state)
                 continue
             target_ds = ds_by_coda_table.get(target_coda_table)
             if target_ds is None:
@@ -677,6 +681,8 @@ def migrate(
                     "  %r references table %s which was not migrated; skipping",
                     prop_name, target_coda_table,
                 )
+                rel["wired"] = True
+                save_state(state_path, state)
                 continue
 
             notion.add_relation_property(rec["notion_data_source_id"], prop_name, target_ds)
@@ -697,6 +703,8 @@ def migrate(
                     notion.set_page_relation(page_id, prop_name, target_pages)
                     wired += 1
             log.info("  %r -> %s: linked %d rows", prop_name, target_coda_table, wired)
+            rel["wired"] = True
+            save_state(state_path, state)
 
         rec["relations_wired"] = True
         save_state(state_path, state)
